@@ -338,23 +338,36 @@ export function useBuzzSession({
         tags: [["status", status]],
       });
 
-    void client
-      .connect()
-      .then(async () => {
-        if (cancelled) return;
-        await loadChannels();
-        unsubscribePresence = await client.subscribe({ kinds: [20001], limit: 0 }, (event) => {
-          applyPresenceEvents([event]);
-        });
-        await publishPresence("online").catch(() => undefined);
-        presenceUpdatedAt.current[pubkey.toLowerCase()] = Date.now();
-        setPresence((current) => ({ ...current, [pubkey]: "online" }));
-      })
-      .catch((connectError) => {
-        if (!cancelled) {
+    let retryTimer: number | null = null;
+    const connectAndLoad = () => {
+      void client
+        .connect()
+        .then(async () => {
+          if (cancelled) return;
+          await loadChannels();
+          if (cancelled) return;
+          unsubscribePresence?.();
+          unsubscribePresence = await client.subscribe({ kinds: [20001], limit: 0 }, (event) => {
+            applyPresenceEvents([event]);
+          });
+          await publishPresence("online").catch(() => undefined);
+          if (cancelled) return;
+          presenceUpdatedAt.current[pubkey.toLowerCase()] = Date.now();
+          setPresence((current) => ({ ...current, [pubkey]: "online" }));
+        })
+        .catch((connectError) => {
+          if (cancelled) return;
+          // A failed initial handshake must not leave the UI spinning forever.
+          setLoadingChannels(false);
           setError(connectError instanceof Error ? connectError.message : t("error.relayConnect"));
-        }
-      });
+          // Transient network/signing timeouts should recover without replacing the identity.
+          retryTimer = window.setTimeout(() => {
+            retryTimer = null;
+            if (!cancelled) connectAndLoad();
+          }, 5_000);
+        });
+    };
+    connectAndLoad();
 
     const heartbeat = window.setInterval(() => {
       if (client.connectionState === "connected") {
@@ -374,6 +387,7 @@ export function useBuzzSession({
 
     return () => {
       cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
       unsubscribeState();
       unsubscribePresence?.();
       window.clearInterval(heartbeat);
